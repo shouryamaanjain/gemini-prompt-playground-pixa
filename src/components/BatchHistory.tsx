@@ -4,6 +4,7 @@ interface BatchRun {
   id: string;
   segment_count: number;
   status: "in_progress" | "completed";
+  gemini_done_count?: number;
   created_at: string;
 }
 
@@ -63,6 +64,11 @@ export default function BatchHistory({ batches, loading, onSelect }: BatchHistor
               ) : (
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-900/50 text-green-400 border border-green-800">
                   completed
+                </span>
+              )}
+              {batch.status === "in_progress" && batch.gemini_done_count != null && (
+                <span className="text-[10px] text-zinc-500">
+                  {batch.gemini_done_count}/{batch.segment_count} processed
                 </span>
               )}
             </div>

@@ -21,6 +21,7 @@ interface BatchRun {
   segments: { video_id: string; segment_id: string }[];
   gemini_config: GeminiConfig | null;
   status: "in_progress" | "completed";
+  gemini_done_count?: number;
   created_at: string;
 }
 
@@ -72,28 +73,15 @@ export default function Home() {
   // Config
   const [geminiConfig, setGeminiConfig] = useState<GeminiConfig>(buildDefaultConfig);
 
+  // Guard: prevents auto-resume from racing with user interaction
+  const userInteractedRef = useRef(false);
+
   // Derive form fields from schema (use reviewConfig in review mode)
   const activeConfig = appPhase === "reviewing" && reviewConfig ? reviewConfig : geminiConfig;
   const fields = useMemo(
     () => parseSchemaFields(activeConfig.schemaJson),
     [activeConfig.schemaJson]
   );
-
-  // Reset answers when schema fields change during annotation
-  const prevFieldKeys = useRef<string>("");
-  useEffect(() => {
-    const keys = fields.map((f) => f.key).join(",");
-    if (prevFieldKeys.current && prevFieldKeys.current !== keys && appPhase === "annotating") {
-      setBatchState((prev) => {
-        const next = new Map(prev);
-        for (const [k, v] of next) {
-          next.set(k, { ...v, userAnswers: {} });
-        }
-        return next;
-      });
-    }
-    prevFieldKeys.current = keys;
-  }, [fields, appPhase]);
 
   // Load segments
   useEffect(() => {
@@ -102,55 +90,49 @@ export default function Home() {
       .then((segs: Segment[]) => setSegments(segs));
   }, []);
 
-  // Load batch history
-  const loadHistory = useCallback(() => {
-    setHistoryLoading(true);
-    fetch("/api/batch")
-      .then((r) => r.json())
-      .then((data: BatchRun[]) => {
-        setBatchHistory(data);
-        return data;
-      })
-      .then((data) => {
-        // Auto-resume: check for in-progress batch
-        if (appPhase === "selecting" && !batchId) {
-          const inProgress = data.find((b) => b.status === "in_progress");
-          if (inProgress) {
-            resumeBatch(inProgress.id);
-          }
-        }
-      })
-      .catch(() => setBatchHistory([]))
-      .finally(() => setHistoryLoading(false));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    loadHistory();
-  }, [loadHistory]);
-
-  // ─── POLLING: fetch batch state from DB every 2 seconds ──────
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // ─── POLLING with generation counter ─────────────────────────
+  const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollingActiveRef = useRef(false);
+  const pollingGenRef = useRef(0);
 
   const startPolling = useCallback((id: string) => {
-    if (pollingRef.current) clearInterval(pollingRef.current);
+    // Kill any existing polling
+    pollingActiveRef.current = false;
+    if (pollingRef.current) {
+      clearTimeout(pollingRef.current);
+      pollingRef.current = null;
+    }
+
+    // New generation
+    const gen = ++pollingGenRef.current;
+    pollingActiveRef.current = true;
 
     const poll = async () => {
+      if (!pollingActiveRef.current || pollingGenRef.current !== gen) return;
+
       try {
         const res = await fetch(`/api/batch/${id}`);
-        if (!res.ok) return;
+        if (!res.ok || pollingGenRef.current !== gen) return;
         const data = await res.json();
         const annotations: DBAnnotation[] = data.annotations;
+        const batchStatus: string = data.status;
+
+        // Server auto-completed this batch
+        if (batchStatus === "completed") {
+          setBatchCompleted(true);
+          pollingActiveRef.current = false;
+          return;
+        }
 
         setBatchState((prev) => {
           const next = new Map(prev);
           for (const ann of annotations) {
             const key = segKey(ann);
             const existing = next.get(key);
-            // Update Gemini-related fields from DB, preserve local user answers
             next.set(key, {
-              userAnswers: existing?.userAnswers || ann.user_answers || {},
-              geminiResult: ann.gemini_status === "done" ? ann.gemini_answers : (existing?.geminiResult || null),
+              // Always prefer local state over DB (prevents overwriting optimistic saves)
+              userAnswers: existing?.userAnswers ?? ann.user_answers ?? {},
+              geminiResult: ann.gemini_status === "done" ? ann.gemini_answers : (existing?.geminiResult ?? null),
               geminiLoading: ann.gemini_status === "pending" || ann.gemini_status === "processing",
               geminiError: ann.gemini_status === "error" ? (ann.gemini_error || "Unknown error") : null,
               transcriptCorrect: existing?.transcriptCorrect ?? ann.user_transcript_correct,
@@ -160,25 +142,31 @@ export default function Home() {
         });
 
         // Stop polling when all Gemini processing is done
-        const allDone = annotations.every(
+        const allGeminiDone = annotations.every(
           (a) => a.gemini_status === "done" || a.gemini_status === "error"
         );
-        if (allDone && pollingRef.current) {
-          clearInterval(pollingRef.current);
-          pollingRef.current = null;
+        if (allGeminiDone) {
+          pollingActiveRef.current = false;
+          return;
         }
       } catch {
-        // Ignore poll errors
+        // Ignore poll errors, will retry
+      }
+
+      // Schedule next poll only if still valid generation
+      if (pollingActiveRef.current && pollingGenRef.current === gen) {
+        pollingRef.current = setTimeout(poll, 2000);
       }
     };
 
-    poll(); // Immediate first poll
-    pollingRef.current = setInterval(poll, 2000);
+    poll();
   }, []);
 
   const stopPolling = useCallback(() => {
+    pollingActiveRef.current = false;
+    pollingGenRef.current++;
     if (pollingRef.current) {
-      clearInterval(pollingRef.current);
+      clearTimeout(pollingRef.current);
       pollingRef.current = null;
     }
   }, []);
@@ -190,6 +178,9 @@ export default function Home() {
 
   // ─── RESUME BATCH ────────────────────────────────────────────
   const resumeBatch = useCallback(async (id: string) => {
+    userInteractedRef.current = true;
+    stopPolling();
+
     try {
       const res = await fetch(`/api/batch/${id}`);
       if (!res.ok) return;
@@ -207,7 +198,7 @@ export default function Home() {
         return segMap.get(key) || {
           video_id: bs.video_id,
           segment_id: bs.segment_id,
-          audio_url: `/api/segments/${bs.video_id}/${bs.segment_id}`,
+          audio_url: `/api/audio/${bs.video_id}/${bs.segment_id}.wav`,
         };
       });
 
@@ -230,7 +221,7 @@ export default function Home() {
         if (config) setGeminiConfig(config);
         setAppPhase("annotating");
 
-        // Check for stalled segments and resume
+        // Check for stalled segments and resume server-side Gemini
         const hasStalled = annotations.some(
           (a) => a.gemini_status === "pending" || a.gemini_status === "processing"
         );
@@ -238,14 +229,36 @@ export default function Home() {
           fetch(`/api/batch/${id}/resume`, { method: "POST" }).catch(() => {});
         }
 
-        // Start polling for Gemini updates
+        // Start polling
         startPolling(id);
       }
     } catch (err) {
       console.error("Failed to resume batch:", err);
     }
+  }, [segments, startPolling, stopPolling]);
+
+  // ─── LOAD HISTORY (auto-resume most recent in-progress on mount) ──
+  const loadHistory = useCallback((autoResume = false) => {
+    setHistoryLoading(true);
+    fetch("/api/batch")
+      .then((r) => r.json())
+      .then((data: BatchRun[]) => {
+        setBatchHistory(data);
+        if (autoResume && !userInteractedRef.current) {
+          const inProgress = data.find((b) => b.status === "in_progress");
+          if (inProgress) {
+            resumeBatch(inProgress.id);
+          }
+        }
+      })
+      .catch(() => setBatchHistory([]))
+      .finally(() => setHistoryLoading(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segments, startPolling]);
+  }, [resumeBatch]);
+
+  useEffect(() => {
+    loadHistory(true);
+  }, [loadHistory]);
 
   // Current state helpers
   const currentBatchSeg = batchSegments[batchIndex];
@@ -293,7 +306,6 @@ export default function Home() {
   const retryGemini = useCallback((segment: Segment) => {
     if (!batchId) return;
 
-    // Optimistically set to loading
     const k = segKey(segment);
     setBatchState((prev) => {
       const next = new Map(prev);
@@ -311,7 +323,7 @@ export default function Home() {
       }),
     }).catch(() => {});
 
-    // Restart polling
+    // Restart polling to pick up the retry result
     startPolling(batchId);
   }, [batchId, startPolling]);
 
@@ -319,6 +331,9 @@ export default function Home() {
   const handleStartBatch = useCallback(async () => {
     const selected = segments.filter((s) => selectedSet.has(segKey(s)));
     if (selected.length === 0) return;
+
+    userInteractedRef.current = true;
+    stopPolling();
 
     const segmentRefs = selected.map((s) => ({
       video_id: s.video_id,
@@ -337,18 +352,12 @@ export default function Home() {
 
       if (!res.ok) {
         const err = await res.json();
-        if (res.status === 409 && err.existing_id) {
-          // Another batch in progress — resume it
-          resumeBatch(err.existing_id);
-          return;
-        }
         alert(err.error || "Failed to create batch");
         return;
       }
 
       const { id } = await res.json();
 
-      // Initialize local state as all-pending
       const initState = new Map<string, BatchSegmentState>();
       for (const s of selected) {
         initState.set(segKey(s), {
@@ -367,20 +376,16 @@ export default function Home() {
       setBatchCompleted(false);
       setAppPhase("annotating");
 
-      // Start polling (Gemini already running server-side)
       startPolling(id);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to create batch";
       alert(message);
     }
-  }, [segments, selectedSet, geminiConfig, resumeBatch, startPolling]);
+  }, [segments, selectedSet, geminiConfig, startPolling, stopPolling]);
 
   // ─── BACK TO SELECTION ───────────────────────────────────────
   const handleBackToSelection = useCallback(() => {
-    if (appPhase === "annotating" && !batchCompleted) {
-      // Batch is in-progress — just go back, everything is persisted
-      // No confirmation needed since state is saved to DB
-    }
+    userInteractedRef.current = true;
     stopPolling();
     setAppPhase("selecting");
     setBatchId(null);
@@ -390,7 +395,7 @@ export default function Home() {
     setBatchCompleted(false);
     setReviewConfig(null);
     loadHistory();
-  }, [appPhase, batchCompleted, stopPolling, loadHistory]);
+  }, [stopPolling, loadHistory]);
 
   // ─── UPDATE ANSWERS (optimistic local + save to DB) ──────────
   const updateCurrentAnswers = useCallback((answers: Record<string, unknown>) => {
@@ -423,35 +428,39 @@ export default function Home() {
     }
   }, [currentBatchKey, currentBatchSeg, saveAnswerToDB]);
 
-  // ─── SUBMIT (complete) BATCH ─────────────────────────────────
-  const submitBatch = useCallback(async () => {
-    if (!batchId) return;
-
-    try {
-      const res = await fetch(`/api/batch/${batchId}`, {
-        method: "PATCH",
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        alert(err.error || "Failed to complete batch");
-        return;
-      }
-
-      setBatchCompleted(true);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Complete failed";
-      alert(message);
+  // ─── AUTO-COMPLETE: fires PATCH when all segments done ───────
+  const autoCompleteRef = useRef(false);
+  useEffect(() => {
+    if (appPhase !== "annotating" || batchCompleted || !batchId) {
+      autoCompleteRef.current = false;
+      return;
     }
-  }, [batchId]);
+    if (batchSegments.length === 0) return;
 
-  // ─── LOAD BATCH FOR REVIEW ──────────────────────────────────
+    const allComplete = batchSegments.every((seg) =>
+      isSegmentComplete(batchState.get(segKey(seg)), fields)
+    );
+
+    if (allComplete && !autoCompleteRef.current) {
+      autoCompleteRef.current = true;
+      fetch(`/api/batch/${batchId}`, { method: "PATCH" })
+        .then((res) => {
+          if (res.ok) setBatchCompleted(true);
+        })
+        .catch(() => {});
+    } else if (!allComplete) {
+      autoCompleteRef.current = false;
+    }
+  }, [appPhase, batchCompleted, batchId, batchSegments, batchState, fields]);
+
+  // ─── LOAD BATCH FOR REVIEW / RESUME ──────────────────────────
   const loadBatchForReview = useCallback(async (id: string, status?: string) => {
-    // If the batch is in-progress, resume it instead of reviewing
     if (status === "in_progress") {
       resumeBatch(id);
       return;
     }
+
+    stopPolling();
 
     try {
       const res = await fetch(`/api/batch/${id}`);
@@ -468,7 +477,7 @@ export default function Home() {
         return segMap.get(key) || {
           video_id: bs.video_id,
           segment_id: bs.segment_id,
-          audio_url: `/api/segments/${bs.video_id}/${bs.segment_id}`,
+          audio_url: `/api/audio/${bs.video_id}/${bs.segment_id}.wav`,
         };
       });
 
@@ -487,7 +496,7 @@ export default function Home() {
     } catch (err) {
       console.error("Failed to load batch:", err);
     }
-  }, [segments, resumeBatch]);
+  }, [segments, resumeBatch, stopPolling]);
 
   // ─── KEYBOARD SHORTCUTS ──────────────────────────────────────
   useEffect(() => {
@@ -518,9 +527,7 @@ export default function Home() {
     fields.every((f) => currentSegState.userAnswers[f.key] !== undefined);
 
   // Batch-level completion
-  const allSegmentsComplete = batchSegments.length > 0 &&
-    batchSegments.every((seg) => isSegmentComplete(batchState.get(segKey(seg)), fields));
-  const canSubmitBatch = allSegmentsComplete && !batchCompleted;
+  const completeCount = Array.from(batchState.values()).filter((s) => isSegmentComplete(s, fields)).length;
 
   const isReadOnly = appPhase === "reviewing" || batchCompleted;
 
@@ -583,7 +590,6 @@ export default function Home() {
         {appPhase === "reviewing" ? "Batch Review" : "Annotation Dashboard"}
       </h1>
 
-      {/* Settings — locked during annotation, shown read-only in review */}
       <GeminiSettingsPanel
         config={activeConfig}
         onChange={setGeminiConfig}
@@ -618,7 +624,6 @@ export default function Home() {
               disabled={isReadOnly}
             />
 
-            {/* Gemini Status */}
             {currentSegState.geminiLoading && (
               <div className="text-center py-3">
                 <p className="text-zinc-500 text-sm animate-pulse">
@@ -633,7 +638,6 @@ export default function Home() {
               </p>
             )}
 
-            {/* Transcript Review */}
             {geminiDone && typeof currentSegState.geminiResult?.transcript === "string" && (
               <TranscriptReview
                 transcript={currentSegState.geminiResult.transcript as string}
@@ -643,7 +647,7 @@ export default function Home() {
               />
             )}
 
-            {/* Per-segment status hints (only during annotation) */}
+            {/* Per-segment status hints */}
             {!isReadOnly && (
               <div className="space-y-1">
                 {!geminiFinished && (
@@ -662,7 +666,6 @@ export default function Home() {
             )}
           </div>
 
-          {/* DiffView — shows when Gemini is done */}
           {geminiDone && (
             <DiffView
               fields={fields}
@@ -671,26 +674,15 @@ export default function Home() {
             />
           )}
 
-          {/* Batch Submit (only during annotation, not completed) */}
+          {/* Batch progress */}
           {appPhase === "annotating" && !batchCompleted && (
-            <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-zinc-300 font-medium">
-                    {Array.from(batchState.values()).filter((s) => isSegmentComplete(s, fields)).length} / {batchSegments.length} segments complete
-                  </p>
-                  {!allSegmentsComplete && (
-                    <p className="text-xs text-zinc-500">Complete all segments to submit the batch</p>
-                  )}
-                </div>
-                <button
-                  onClick={submitBatch}
-                  disabled={!canSubmitBatch}
-                  className="px-6 py-3 rounded-lg font-medium text-sm transition bg-white text-black hover:bg-zinc-200 disabled:opacity-30 disabled:cursor-not-allowed"
-                >
-                  Submit Batch
-                </button>
-              </div>
+            <div className="bg-zinc-900 rounded-xl p-4 border border-zinc-800">
+              <p className="text-sm text-zinc-300 font-medium">
+                {completeCount} / {batchSegments.length} segments complete
+              </p>
+              <p className="text-xs text-zinc-500 mt-1">
+                Batch auto-completes when all segments are done. Progress is auto-saved.
+              </p>
             </div>
           )}
 
@@ -704,13 +696,6 @@ export default function Home() {
                 Back to dashboard
               </button>
             </div>
-          )}
-
-          {/* Persistent state indicator */}
-          {appPhase === "annotating" && !batchCompleted && (
-            <p className="text-center text-[10px] text-zinc-600">
-              All progress auto-saved. Safe to close tab or refresh.
-            </p>
           )}
 
           {/* Keyboard hints */}

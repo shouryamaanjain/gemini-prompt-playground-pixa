@@ -29,7 +29,7 @@ export async function GET() {
     return {
       video_id: videoId,
       segment_id: segmentId,
-      audio_url: `/api/audio?video_id=${videoId}&file=${segmentFile}`,
+      audio_url: `/api/audio/${videoId}/${segmentFile}`,
     };
   });
 

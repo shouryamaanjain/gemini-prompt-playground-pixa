@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { processGeminiBatch } from "@/lib/gemini-batch";
 
+const MAX_BATCH_SIZE = 500;
+
 function getSupabase() {
   return createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL || "",
@@ -19,23 +21,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "segments array required" }, { status: 400 });
     }
 
-    const supabase = getSupabase();
-
-    // Check no other batch is in_progress
-    const { data: existing } = await supabase
-      .from("batch_runs")
-      .select("id")
-      .eq("status", "in_progress")
-      .limit(1);
-
-    if (existing && existing.length > 0) {
-      return NextResponse.json(
-        { error: "Another batch is already in progress", existing_id: existing[0].id },
-        { status: 409 }
-      );
+    if (segments.length > MAX_BATCH_SIZE) {
+      return NextResponse.json({ error: `Batch size limited to ${MAX_BATCH_SIZE} segments` }, { status: 400 });
     }
 
-    // Create batch run
+    const supabase = getSupabase();
+
+    // Create batch run (no 409 check — multiple in-progress batches allowed)
     const { data: batch, error: batchError } = await supabase
       .from("batch_runs")
       .insert({
@@ -80,7 +72,7 @@ export async function POST(request: Request) {
   }
 }
 
-// List all batch runs
+// List all batch runs (with progress counts for in-progress batches)
 export async function GET() {
   try {
     const supabase = getSupabase();
@@ -94,7 +86,21 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    return NextResponse.json(data || []);
+    const batches = data || [];
+
+    // Augment in-progress batches with gemini_done_count
+    for (const batch of batches) {
+      if (batch.status === "in_progress") {
+        const { count } = await supabase
+          .from("annotations")
+          .select("*", { count: "exact", head: true })
+          .eq("batch_id", batch.id)
+          .in("gemini_status", ["done", "error"]);
+        (batch as Record<string, unknown>).gemini_done_count = count ?? 0;
+      }
+    }
+
+    return NextResponse.json(batches);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
