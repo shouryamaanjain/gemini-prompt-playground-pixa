@@ -1,11 +1,9 @@
-import fs from "fs";
-import path from "path";
 import { createClient } from "@supabase/supabase-js";
 import { analyzeSegment } from "./gemini";
+import { downloadBuffer } from "./gcs";
 import { Semaphore } from "./semaphore";
 import type { GeminiConfig } from "./gemini-defaults";
 
-const SEGMENTS_DIR = path.join(process.cwd(), "segments");
 const CONCURRENCY = 5;
 
 function getSupabase() {
@@ -39,12 +37,8 @@ export function processGeminiBatch(
           .eq("video_id", seg.video_id)
           .eq("segment_id", seg.segment_id);
 
-        // Read audio
-        const audioPath = path.join(SEGMENTS_DIR, seg.video_id, `${seg.segment_id}.wav`);
-        if (!fs.existsSync(audioPath)) {
-          throw new Error(`Audio file not found: ${audioPath}`);
-        }
-        const audioBuffer = fs.readFileSync(audioPath);
+        // Download audio from GCS
+        const audioBuffer = await downloadBuffer(seg.video_id, `${seg.segment_id}.wav`);
         const audioBase64 = audioBuffer.toString("base64");
 
         // Call Gemini

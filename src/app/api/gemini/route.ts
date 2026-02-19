@@ -1,10 +1,7 @@
 import { NextResponse } from "next/server";
-import fs from "fs";
-import path from "path";
 import { analyzeSegment } from "@/lib/gemini";
+import { downloadBuffer } from "@/lib/gcs";
 import type { GeminiConfig } from "@/lib/gemini-defaults";
-
-const SEGMENTS_DIR = path.join(process.cwd(), "segments");
 
 function validateConfig(config: GeminiConfig): string | null {
   try {
@@ -45,12 +42,7 @@ export async function POST(request: Request) {
       }
     }
 
-    const audioPath = path.join(SEGMENTS_DIR, video_id, `${segment_id}.wav`);
-    if (!fs.existsSync(audioPath)) {
-      return NextResponse.json({ error: "Audio file not found" }, { status: 404 });
-    }
-
-    const audioBuffer = fs.readFileSync(audioPath);
+    const audioBuffer = await downloadBuffer(video_id, `${segment_id}.wav`);
     const audioBase64 = audioBuffer.toString("base64");
 
     const result = await analyzeSegment(audioBase64, "audio/wav", geminiConfig);

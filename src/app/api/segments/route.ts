@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 
-const SEGMENTS_DIR = path.join(process.cwd(), "segments");
+const SEGMENTS_FILE = path.join(process.cwd(), "segments.txt");
 
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
@@ -14,22 +14,24 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 export async function GET() {
-  const videos = fs.readdirSync(SEGMENTS_DIR).filter((d) => {
-    return fs.statSync(path.join(SEGMENTS_DIR, d)).isDirectory();
-  });
+  const lines = fs.readFileSync(SEGMENTS_FILE, "utf-8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && l.endsWith(".wav"));
 
-  const allSegments = [];
-  for (const videoId of videos) {
-    const videoDir = path.join(SEGMENTS_DIR, videoId);
-    const wavFiles = fs.readdirSync(videoDir).filter((f) => f.endsWith(".wav")).sort();
-    for (const f of wavFiles) {
-      allSegments.push({
-        video_id: videoId,
-        segment_id: f.replace(".wav", ""),
-        audio_url: `/segments/${videoId}/${f}`,
-      });
-    }
-  }
+  const allSegments = lines.map((line) => {
+    // line format: video_id/segment.wav
+    const parts = line.split("/");
+    const videoId = parts[0];
+    const segmentFile = parts[1];
+    const segmentId = segmentFile.replace(".wav", "");
+
+    return {
+      video_id: videoId,
+      segment_id: segmentId,
+      audio_url: `/api/audio?video_id=${videoId}&file=${segmentFile}`,
+    };
+  });
 
   return NextResponse.json(shuffle(allSegments));
 }
